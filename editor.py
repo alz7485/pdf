@@ -861,7 +861,7 @@ class PDFDragHandle(QFrame):
         self.pdf_path = normalize_path(pdf_path)
         self._press_pos = None
         self.setObjectName('pdfDragHandle')
-        self.setFixedWidth(42)
+        self.setFixedWidth(30)
         self.setCursor(Qt.OpenHandCursor)
         self.setToolTip('ドラッグ専用：サムネイルへ全ページ挿入')
         self.setFocusPolicy(Qt.NoFocus)
@@ -1382,7 +1382,10 @@ class PageManagerDialog(QDialog):
                 item = QListWidgetItem()
                 item.setData(Qt.UserRole, path)
                 item.setToolTip(path)
-                item.setSizeHint(QSize(240, 38))
+                # 横幅を固定しない。縦スクロールバーが出た時はviewport幅へ自動追従させる。
+                # 固定幅を持たせると横スクロール非表示時に右端のドラッグハンドルが
+                # viewport外へクリップされるため、高さだけを指定する。
+                item.setSizeHint(QSize(0, 38))
                 widget.addItem(item)
 
                 row_widget = PDFSourceRowWidget(
