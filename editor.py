@@ -782,6 +782,23 @@ class EditorPDFSourceList(QListWidget):
         # 追加の右viewport marginは入れない。ここに余白を入れると行ウィジェットが
         # 余計に狭くなり、右端のドラッグハンドルがクリップされて見えなくなる。
         self.setViewportMargins(0, 0, 0, 0)
+        # 各行の横幅はviewportの実幅へ追従させる。
+        # 縦スクロールバーの表示/非表示でviewport幅が変わっても、
+        # 右端のドラッグハンドルが必ず表示領域内に残るようにする。
+        self.verticalScrollBar().rangeChanged.connect(
+            lambda _min, _max: QTimer.singleShot(0, self._sync_item_widths)
+        )
+
+    def _sync_item_widths(self):
+        width = max(1, self.viewport().width() - 2)
+        for row in range(self.count()):
+            item = self.item(row)
+            if item is not None:
+                item.setSizeHint(QSize(width, 38))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._sync_item_widths()
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Delete:
@@ -1382,10 +1399,9 @@ class PageManagerDialog(QDialog):
                 item = QListWidgetItem()
                 item.setData(Qt.UserRole, path)
                 item.setToolTip(path)
-                # 横幅を固定しない。縦スクロールバーが出た時はviewport幅へ自動追従させる。
-                # 固定幅を持たせると横スクロール非表示時に右端のドラッグハンドルが
-                # viewport外へクリップされるため、高さだけを指定する。
-                item.setSizeHint(QSize(0, 38))
+                # 初期幅も現在のviewport実幅に合わせる。以後は
+                # EditorPDFSourceList._sync_item_widths() がスクロールバー表示を含めて追従する。
+                item.setSizeHint(QSize(max(1, widget.viewport().width() - 2), 38))
                 widget.addItem(item)
 
                 row_widget = PDFSourceRowWidget(
@@ -1398,6 +1414,7 @@ class PageManagerDialog(QDialog):
                 widget.setItemWidget(item, row_widget)
         finally:
             widget.blockSignals(False)
+        widget._sync_item_widths()
 
     def _populate_pdf_source_list(self):
         # temp フォルダ側は、削除済みファイルを消し、新規ファイルを拾う。
