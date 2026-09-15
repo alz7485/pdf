@@ -766,6 +766,7 @@ class EditorPDFSourceList(QListWidget):
     """
     MIME_TYPE = 'application/x-fastpdf-source-pdf'
     pdfFilesDropped = Signal(object)
+    deleteRequested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -777,6 +778,15 @@ class EditorPDFSourceList(QListWidget):
         self.setDragDropMode(QAbstractItemView.DropOnly)
         # 縦スクロールバー表示時にも横スクロールバーを出さない。
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        # 縦スクロールバーが表示されても、行右端のドラッグハンドルと重ならないようにする。
+        self.setViewportMargins(0, 0, 4, 0)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Delete:
+            self.deleteRequested.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def _pdf_paths_from_mime(self, mime):
         if not mime.hasUrls():
@@ -1494,6 +1504,58 @@ class PageManagerDialog(QDialog):
 
         self.pdfListChanged.emit(list(self.pdf_paths))
 
+    def delete_selected_pdf_from_source_list(self):
+        """通常PDFリストの選択PDFをリストから削除し、ビューアへ即時反映する。"""
+        widget = self.pdf_source_list
+        item = widget.currentItem()
+        if item is None:
+            return
+
+        path = normalize_path(item.data(Qt.UserRole))
+        if not path or path not in self.pdf_paths:
+            return
+
+        # 現在編集中のPDFを消す場合だけ、未保存編集の破棄確認を行う。
+        if path == normalize_path(self.pdf_path) and self.dirty:
+            result = QMessageBox.question(
+                self,
+                'PDFリストから削除',
+                '現在編集中のPDFには未保存の編集があります。\n\n'
+                '編集内容を破棄してリストから削除しますか？',
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            if result != QMessageBox.Yes:
+                self._sync_source_selection()
+                return
+
+        old_index = self.pdf_paths.index(path)
+        self.pdf_paths = [p for p in self.pdf_paths if normalize_path(p) != path]
+
+        # 編集中ではないPDFなら、現在の編集対象はそのまま維持する。
+        if path != normalize_path(self.pdf_path):
+            self._populate_pdf_source_list()
+            self.pdfListChanged.emit(list(self.pdf_paths))
+            return
+
+        # 現在編集中のPDFを削除した場合は、残っている通常PDFへ切り替える。
+        if self.pdf_paths:
+            next_index = min(old_index, len(self.pdf_paths) - 1)
+            next_path = normalize_path(self.pdf_paths[next_index])
+            self.load_pdf_for_edit(next_path, start_page=0)
+        elif self.temp_paths:
+            # 通常リストが空なら、存在する一時PDFを編集対象として維持できる。
+            next_path = normalize_path(self.temp_paths[0])
+            self.load_pdf_for_edit(next_path, start_page=0)
+        else:
+            # 編集対象が完全になくなった場合はビューアへ戻る。
+            self.pdfListChanged.emit([])
+            self.close()
+            return
+
+        self._populate_pdf_source_list()
+        self.pdfListChanged.emit(list(self.pdf_paths))
+
     def on_pdf_source_changed(self, row):
         if self._switching_pdf or row < 0:
             return
@@ -1866,6 +1928,9 @@ class PageManagerDialog(QDialog):
         self.pdf_source_list.pdfFilesDropped.connect(
             self.add_pdfs_to_source_list
         )
+        self.pdf_source_list.deleteRequested.connect(
+            self.delete_selected_pdf_from_source_list
+        )
         source_layout.addWidget(self.pdf_source_list, 3)
 
         temp_header = QHBoxLayout()
@@ -1898,7 +1963,7 @@ class PageManagerDialog(QDialog):
 
         source_hint = QLabel(
             'ファイル名枠：編集対象切替\n'
-            '右端の ⠿ 枠：選択を変えずに全ページD&D'
+            '右端の ⠿ 枠：選択を変えずに全ページD&D / Delete：リストから削除'
         )
         source_hint.setWordWrap(True)
         source_layout.addWidget(source_hint)
