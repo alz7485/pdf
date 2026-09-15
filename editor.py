@@ -778,8 +778,10 @@ class EditorPDFSourceList(QListWidget):
         self.setDragDropMode(QAbstractItemView.DropOnly)
         # 縦スクロールバー表示時にも横スクロールバーを出さない。
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        # 縦スクロールバーが表示されても、行右端のドラッグハンドルと重ならないようにする。
-        self.setViewportMargins(0, 0, 4, 0)
+        # QListWidgetのviewport自体が縦スクロールバー分だけ自動的に狭くなるため、
+        # 追加の右viewport marginは入れない。ここに余白を入れると行ウィジェットが
+        # 余計に狭くなり、右端のドラッグハンドルがクリップされて見えなくなる。
+        self.setViewportMargins(0, 0, 0, 0)
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Delete:
