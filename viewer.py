@@ -6,11 +6,11 @@ import tempfile
 from pathlib import Path
 from datetime import date
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor
+import gc
 
 import fitz
-from PySide6.QtCore import Qt, QSize, QRectF, Signal, QThread, QEvent, QTimer, QMarginsF, QMimeData
-from PySide6.QtGui import QImage, QPixmap, QPainter, QPageSize, QPageLayout, QTransform, QColor, QPen, QDrag, QFont
+from PySide6.QtCore import Qt, QSize, QRectF, Signal, QThread, QEvent, QTimer, QMimeData
+from PySide6.QtGui import QImage, QPixmap, QPainter, QTransform, QColor, QPen, QDrag, QFont, QAction
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QListWidget, QListWidgetItem,
     QPushButton, QToolButton, QComboBox, QHBoxLayout, QVBoxLayout, QGridLayout,
@@ -18,13 +18,13 @@ from PySide6.QtWidgets import (
     QDialogButtonBox, QGroupBox, QLineEdit, QButtonGroup, QScrollArea,
     QAbstractItemView, QListView, QInputDialog, QGraphicsView, QGraphicsScene,
     QFormLayout, QFrame, QTextEdit, QPlainTextEdit, QDoubleSpinBox,
-    QTabWidget, QTextBrowser, QProgressDialog, QStackedWidget, QSizePolicy
+    QTabWidget, QTextBrowser, QProgressDialog, QStackedWidget, QSizePolicy,
+    QSystemTrayIcon, QMenu, QStyle
 )
-from PySide6.QtPrintSupport import QPrinter, QPrinterInfo
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
-from editor import PageManagerDialog
-from print_dialog import PrintDialog
+# editor / print_dialog は起動時に読み込まない。
+# 実際に編集・印刷を開いた時だけ import してコールドスタートを軽くする。
 from pdf_core import (
     APP_DIR, PageEntry, normalize_path, get_temp_dir, is_temp_pdf_path, make_temp_pdf_path,
     open_temp_folder, safe_json_load, safe_json_save, render_page_image,
@@ -301,10 +301,16 @@ class RenderWorker(QThread):
 
     def run(self):
         try:
+            if self.isInterruptionRequested():
+                return
             image = render_page_image(self.pdf_path, self.page_index, self.dpi)
+            # トレイ待機へ移行した場合、完成した大きな画像をUI側へ戻さない。
+            if self.isInterruptionRequested():
+                return
             self.rendered.emit(self.pdf_path, self.page_index, self.dpi, self.generation, image)
         except Exception as e:
-            self.failed.emit(self.pdf_path, self.page_index, str(e))
+            if not self.isInterruptionRequested():
+                self.failed.emit(self.pdf_path, self.page_index, str(e))
 
 
 class PDFListWidget(QListWidget):
@@ -719,13 +725,119 @@ class MainWindow(QMainWindow):
         self._pan_start_h = 0
         self._pan_start_v = 0
 
+        # × は終了ではなく「軽量トレイ待機」。
+        # 完全終了はトレイメニューの「終了」だけで行う。
+        self._allow_real_close = False
+        self._tray_waiting = False
+
         self.setWindowTitle(APP_NAME)
         self.resize(1450, 920)
         self.setAcceptDrops(True)
         self.build_ui()
         self.refresh_preset_combo()
+        self.setup_tray_icon()
         QApplication.instance().installEventFilter(self)
         self.statusBar().showMessage('↑↓ PDF切替 / ←→・ホイール ページ移動 / Ctrl+ホイール 拡大縮小 / 中ボタンドラッグ パン / Space ⭐')
+
+    def setup_tray_icon(self):
+        """FastPDFを軽量待機させるためのトレイアイコンを作る。"""
+        self.tray_icon = QSystemTrayIcon(self)
+        icon = self.windowIcon()
+        if icon.isNull():
+            icon = QApplication.style().standardIcon(QStyle.SP_FileIcon)
+        self.tray_icon.setIcon(icon)
+        self.tray_icon.setToolTip('FastPDF')
+
+        menu = QMenu()
+        show_action = QAction('表示', self)
+        show_action.triggered.connect(self.restore_from_tray)
+        exit_action = QAction('終了', self)
+        exit_action.triggered.connect(self.quit_from_tray)
+        menu.addAction(show_action)
+        menu.addSeparator()
+        menu.addAction(exit_action)
+        self.tray_icon.setContextMenu(menu)
+        self.tray_icon.activated.connect(self.on_tray_activated)
+        self.tray_icon.show()
+
+    def on_tray_activated(self, reason):
+        if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
+            self.restore_from_tray()
+
+    def restore_from_tray(self):
+        """トレイから空のFastPDFを再表示する。"""
+        self._tray_waiting = False
+        self.show()
+        if self.isMinimized():
+            self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _release_session_for_tray(self):
+        """×時にPDF由来の重いメモリとセッション情報だけを解放する。"""
+        self.generation += 1
+
+        # 実行中レンダーは中断要求。完了後の画像はRenderWorker側でUIへ返さない。
+        for worker in list(self.workers):
+            try:
+                worker.requestInterruption()
+            except Exception:
+                pass
+
+        self.close_current_doc()
+
+        # QImage / QPixmap とPDF単位の一時情報をすべて破棄。
+        self.cache.clear()
+        self.pending_keys.clear()
+        self.page_detail_dpi.clear()
+        self.page_view_rotations.clear()
+        self.page_positions.clear()
+        self.print_session_settings.clear()
+
+        self.current_path = None
+        self.current_page = 0
+        self.multi_selection_active = False
+        self.favorite_mode = False
+
+        # ×で空にするのは「現在セッションのリスト」だけ。
+        # 名前付きプリセットJSONへ空リストを自動保存しない。
+        self.pdf_paths.clear()
+        self.pdf_list.blockSignals(True)
+        try:
+            self.pdf_list.clear()
+        finally:
+            self.pdf_list.blockSignals(False)
+        self.current_preset = PresetManager.EMPTY_NAME
+        self.refresh_preset_combo(PresetManager.EMPTY_NAME)
+
+        # 表示中Pixmapも明示的に外してから空表示へ戻す。
+        self.page_label.setPixmap(QPixmap())
+        self.clear_view()
+        self.update_status()
+        self.page_manager_btn.setEnabled(False)
+        self.statusBar().showMessage('トレイで待機中')
+
+        # Python側で参照が切れた大きな画像を早めに回収する。
+        gc.collect()
+
+    def enter_tray_wait(self):
+        if self._tray_waiting:
+            self.hide()
+            return
+        self._tray_waiting = True
+        self._release_session_for_tray()
+        self.hide()
+
+    def quit_from_tray(self):
+        """トレイメニューからのみFastPDFを完全終了する。"""
+        self._allow_real_close = True
+        self._tray_waiting = False
+        try:
+            self.tray_icon.hide()
+        except Exception:
+            pass
+        self.close()
+        QApplication.instance().quit()
 
     def emoji_button(self, text, tooltip, slot, checkable=False):
         return make_tool_button(text, tooltip, slot, checkable)
@@ -1804,9 +1916,11 @@ class MainWindow(QMainWindow):
             self.page_positions[self.current_path] = self.current_page
         self.close_current_doc()
 
-        # まず編集ダイアログを生成する。
-        # 生成に失敗した場合はビューアを非表示にしない。
+        # 編集モジュールはここで初めて読み込む。
+        # PDF関連付けからの通常ビューア起動では editor.py を読み込まない。
         try:
+            from editor import PageManagerDialog
+
             dlg = PageManagerDialog(
                 edit_path,
                 self.favorites,
@@ -1965,6 +2079,8 @@ class MainWindow(QMainWindow):
             dlg.activateWindow()
             return
 
+        # トレイ待機中なら、Qt/PyMuPDFを再起動せず新しいセッションとして復帰。
+        self._tray_waiting = False
         self.add_pdf_files(valid)
         target = valid[0]
         if target not in self.pdf_paths:
@@ -1984,6 +2100,19 @@ class MainWindow(QMainWindow):
         self.activateWindow()
 
     def open_print(self):
+        # 印刷モジュールも印刷ボタンを押した時だけ読み込む。
+        # QtPrintSupport と印刷プレビュー一式を通常起動から外す。
+        try:
+            from print_dialog import PrintDialog
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                '印刷',
+                '印刷画面を開くためのモジュールを読み込めませんでした。\n\n'
+                f'{type(e).__name__}: {e}'
+            )
+            return
+
         selected = self.pdf_list.selectedItems()
         if len(selected) > 1:
             paths = [
@@ -2022,6 +2151,13 @@ class MainWindow(QMainWindow):
         ).exec()
 
     def closeEvent(self, event):
+        # 通常の×はプロセスを終了しない。PDF/画像/リスト/印刷設定を解放して
+        # 最小限のQtプロセス＋トレイ＋単一起動IPCだけを残す。
+        if not self._allow_real_close:
+            event.ignore()
+            self.enter_tray_wait()
+            return
+
         self.close_current_doc()
         for worker in list(self.workers):
             try:
@@ -2034,6 +2170,8 @@ class MainWindow(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
+    # MainWindowを×で隠してもイベントループを維持し、関連付け起動を高速に受ける。
+    app.setQuitOnLastWindowClosed(False)
     app.setApplicationName(APP_NAME)
     app.setStyleSheet(APP_STYLESHEET)
 
