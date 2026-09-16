@@ -202,11 +202,7 @@ def reveal_file_in_explorer(path):
     if target.is_file():
         try:
             if os.name == 'nt':
-                # Explorer の /select は「/select,」と対象パスを別引数にする。
-                # 1文字列に連結すると、空白・日本語・UNCパス等で Explorer が
-                # 対象を正しく解釈せず「ドキュメント」等へ飛ぶことがある。
-                target_str = os.path.normpath(str(target))
-                subprocess.Popen(['explorer.exe', '/select,', target_str])
+                subprocess.Popen(['explorer.exe', f'/select,{str(target)}'])
             else:
                 subprocess.Popen(['xdg-open', str(parent)])
             return 'selected'
